@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude control-plane watchdog (relaunch the serve daemon only when it is down)
+After=default.target
+
+# TEMPLATE — not installed by default. Enabling this makes the control-plane
+# restart AUTOMATIC. Read the "Control-plane restart" section of the README and
+# validate a relaunch in a controlled window first. See issue #4.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/routines/monitor/monitor.py watch --interval=30
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -55,6 +55,39 @@ systemctl --user enable --now service-monitor.service
 With user lingering enabled (`loginctl enable-linger $USER`) it survives logout
 and reboots.
 
+## Control-plane restart
+
+The `--serve` daemon that connects this host to the platform is launched by the
+platform's SSH bootstrap and is supervised by nothing — if it dies, it stays
+dead. The monitor can relaunch it.
+
+**Safety invariant:** a relaunch happens *only when the daemon is provably down*
+— no `--serve` process **and** nothing listening on its RPC socket. The monitor
+never kills or signals a running daemon, so it cannot make a healthy control
+plane worse; the worst case is "couldn't revive an already-dead one". While the
+daemon is healthy the monitor records its exact launch command, so a relaunch
+reproduces the real invocation.
+
+```bash
+python3 monitor.py restart-serve --dry-run   # report what it would do
+python3 monitor.py restart-serve             # relaunch iff down (else: skip)
+python3 monitor.py watch --interval=30       # watchdog: probe + relaunch when down
+python3 monitor.py status                    # print the JSON status once
+```
+
+Relaunches are rate-limited (default 3 per 30 min) to avoid crash loops.
+
+### Automatic restart (opt-in)
+
+`serve-watchdog.service` is a **template** — copy it to
+`~/.config/systemd/user/` and `enable --now` to make restart automatic. Because
+the relaunch mechanics cannot be fully tested without letting the live daemon
+die, validate a real relaunch in a controlled window (where you can restore the
+connection locally if needed) before relying on it unattended.
+
+There is intentionally **no web trigger** for restart yet — a mutating endpoint
+on a network-exposed page is exactly the exposure risk tracked in the issues.
+
 ## Adapting the checks
 
 The checks are wired for one specific host. To add, remove, or retarget a check,

@@ -17,6 +17,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,13 @@ HOME = os.path.expanduser("~")
 BIND = os.environ.get("MONITOR_BIND", "0.0.0.0")
 PORT = int(os.environ.get("MONITOR_PORT", "8787"))
 HOSTNAME = socket.gethostname()
+
+# Control-plane restart state (see restart_serve). Kept out of git.
+STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
+LAUNCH_SPEC = os.path.join(STATE_DIR, "serve-launch.json")
+RESTART_STATE = os.path.join(STATE_DIR, "serve-restart.json")
+RESTART_MAX = 3          # relaunch attempts allowed within the window
+RESTART_WINDOW = 1800    # seconds — the backoff window
 
 # A routine is "stale" once it is this far past its expected cadence.
 DAY = 86400
@@ -90,15 +98,41 @@ def sctl_user_show(unit, props):
 # --------------------------------------------------------------------------- #
 # checks
 # --------------------------------------------------------------------------- #
-def rpc_socket_present(args):
-    """True/False if the daemon's --socket path exists; None if unparseable."""
+def socket_path_from_args(args):
+    """Extract the --socket <path> value from a command line, or None."""
     m = re.search(r"--socket\s+(\S+)", args)
-    if not m:
-        return None
+    return m.group(1) if m else None
+
+
+def unix_socket_alive(path):
+    """True iff something is actually listening on the unix socket at `path`.
+
+    This is the authoritative liveness signal for the control plane — it is how
+    the platform's bootstrap decides whether to start a new server — and it is
+    what makes restart safe: we only relaunch when nothing answers here.
+    """
+    if not path:
+        return False
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        return os.path.exists(m.group(1))
+        s.settimeout(2)
+        s.connect(path)
+        return True
     except OSError:
-        return None
+        return False
+    finally:
+        s.close()
+
+
+def _is_serve(args):
+    """Match the serve daemon by its binary invocation, not a loose substring,
+    so a command that merely *mentions* the pattern (a grep, this monitor's own
+    args) is not miscounted as the daemon."""
+    return "remote/srv/" in args and "/server --serve" in args
+
+
+def _is_bridge(args):
+    return "remote/srv/" in args and "/server --bridge" in args
 
 
 def check_claude_services(procs):
@@ -112,19 +146,20 @@ def check_claude_services(procs):
     items = []
 
     # Persistent serve daemon — the actual control-plane health.
-    serve = next((p for p in procs
-                  if "remote/srv/" in p[4] and " --serve" in p[4]), None)
+    serve = next((p for p in procs if _is_serve(p[4])), None)
     if serve:
         pid, etimes, pcpu, pmem, args = serve
         try:
             uptime = int(etimes)
         except ValueError:
             uptime = None
-        sock_ok = rpc_socket_present(args)
+        sockpath = socket_path_from_args(args)
+        listening = unix_socket_alive(sockpath) if sockpath else None
         status = "ok"
         summary = f"running · pid {pid}"
-        if sock_ok is False:
-            status, summary = "warn", f"running · pid {pid} · rpc socket missing"
+        if listening is False:
+            status = "warn"
+            summary = f"running · pid {pid} · rpc socket not responding"
         items.append({
             "id": "claude-remote-serve", "group": "Claude Services",
             "name": "Claude remote server", "status": status, "summary": summary,
@@ -134,7 +169,8 @@ def check_claude_services(procs):
                 {"label": "CPU", "value": f"{pcpu}%"},
                 {"label": "MEM", "value": f"{pmem}%"},
                 {"label": "RPC socket", "value":
-                    {True: "present", False: "missing"}.get(sock_ok, "unknown")},
+                    {True: "listening", False: "not responding"}.get(
+                        listening, "unknown")},
             ],
         })
     else:
@@ -146,8 +182,7 @@ def check_claude_services(procs):
         })
 
     # Bridges — one per active remote SSH connection; absent == idle, not down.
-    bridges = [p for p in procs
-               if "remote/srv/" in p[4] and " --bridge" in p[4]]
+    bridges = [p for p in procs if _is_bridge(p[4])]
     n = len(bridges)
     detail = [{"label": "Active", "value": str(n)}]
     uptimes = [int(b[1]) for b in bridges if b[1].isdigit()]
@@ -161,6 +196,167 @@ def check_claude_services(procs):
         "note": "bridge processes are spawned per remote SSH connection",
     })
     return items
+
+
+# --------------------------------------------------------------------------- #
+# control-plane restart  (issue #4)
+#
+# The `server --serve` daemon is launched by the platform's SSH bootstrap and is
+# not supervised by anything — if it dies it stays dead. There is no official
+# restart command, so a relaunch means re-exec'ing the exact recorded argv.
+#
+# SAFETY INVARIANT: we only ever relaunch when the daemon is *provably down* —
+# no `--serve` process AND nothing listening on its socket. We never kill or
+# signal a running daemon. The worst case is therefore "couldn't revive a
+# already-dead control plane", never "broke a working one".
+# --------------------------------------------------------------------------- #
+def _serve_procs(procs):
+    return [p for p in procs if _is_serve(p[4])]
+
+
+def capture_launch_spec(procs):
+    """While the daemon is healthy, remember exactly how it was launched so we
+    can reproduce it if it dies. Writes only when the argv changes."""
+    serve = _serve_procs(procs)
+    if not serve:
+        return
+    pid = serve[0][0]
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = [a.decode() for a in fh.read().split(b"\x00") if a]
+    except OSError:
+        return
+    if not argv:
+        return
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = HOME
+    spec = {"argv": argv, "cwd": cwd,
+            "sockpath": socket_path_from_args(" ".join(argv))}
+    try:
+        if os.path.exists(LAUNCH_SPEC):
+            with open(LAUNCH_SPEC) as fh:
+                if json.load(fh).get("argv") == argv:
+                    return
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LAUNCH_SPEC, "w") as fh:
+            json.dump(spec, fh, indent=2)
+    except (OSError, ValueError):
+        pass
+
+
+def load_launch_spec():
+    try:
+        with open(LAUNCH_SPEC) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _recent_attempts(now):
+    try:
+        with open(RESTART_STATE) as fh:
+            att = json.load(fh).get("attempts", [])
+    except (OSError, ValueError):
+        att = []
+    return [t for t in att if now - t < RESTART_WINDOW]
+
+
+def _record_attempt(now):
+    att = _recent_attempts(now) + [now]
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(RESTART_STATE, "w") as fh:
+            json.dump({"attempts": att}, fh)
+    except OSError:
+        pass
+
+
+def _spawn_detached(argv, cwd, logpath):
+    """Launch argv fully detached from this process, logging to logpath."""
+    logf = open(logpath, "a") if logpath else subprocess.DEVNULL
+    try:
+        subprocess.Popen(
+            argv, cwd=cwd or HOME,
+            stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True, env=os.environ.copy(),
+        )
+    finally:
+        if logpath:
+            logf.close()
+
+
+def restart_serve(dry_run=False):
+    """Relaunch the control-plane serve daemon iff it is provably down.
+
+    Returns a result dict with an `action`: skip | error | throttled |
+    would-restart | restarted, and `ok` (bool)."""
+    procs = ps_snapshot()
+    capture_launch_spec(procs)          # keep the spec fresh while healthy
+    serve = _serve_procs(procs)
+    spec = load_launch_spec()
+    sockpath = (spec or {}).get("sockpath")
+    alive = unix_socket_alive(sockpath) if sockpath else False
+
+    # SAFETY INVARIANT: never touch a control plane that is up in any way.
+    if serve or alive:
+        return {"action": "skip", "ok": True,
+                "reason": "control plane is healthy — refusing to touch it",
+                "serve_procs": len(serve), "socket_alive": alive}
+    if not spec:
+        return {"action": "error", "ok": False,
+                "reason": "no launch spec captured yet; let the platform start "
+                          "the daemon once so it can be recorded"}
+
+    now = time.time()
+    recent = _recent_attempts(now)
+    if len(recent) >= RESTART_MAX:
+        return {"action": "throttled", "ok": False,
+                "reason": f"{len(recent)} attempts within "
+                          f"{RESTART_WINDOW // 60}m (cap {RESTART_MAX}) — "
+                          "backing off"}
+    if dry_run:
+        return {"action": "would-restart", "ok": True,
+                "argv": spec["argv"], "cwd": spec.get("cwd"),
+                "sockpath": sockpath}
+
+    # Remove a stale socket file so the fresh daemon can bind. Safe: we already
+    # confirmed nothing is listening on it.
+    try:
+        if sockpath and os.path.exists(sockpath):
+            os.unlink(sockpath)
+    except OSError as exc:
+        return {"action": "error", "ok": False,
+                "reason": f"could not remove stale socket: {exc}"}
+
+    logpath = (os.path.join(os.path.dirname(sockpath), "remote-server.log")
+               if sockpath else None)
+    _record_attempt(now)
+    try:
+        _spawn_detached(spec["argv"], spec.get("cwd"), logpath)
+    except Exception as exc:  # noqa: BLE001
+        return {"action": "error", "ok": False,
+                "reason": f"relaunch failed: {exc}"}
+
+    up = any(time.sleep(0.5) or unix_socket_alive(sockpath) for _ in range(10))
+    return {"action": "restarted", "ok": up,
+            "reason": ("socket is listening" if up else
+                       "relaunched, but socket has not come up yet — check "
+                       "the server log"),
+            "sockpath": sockpath}
+
+
+def watch_serve(interval):
+    """Watchdog loop: probe the control plane and relaunch only when down."""
+    print(f"serve-watchdog: probing every {interval}s "
+          "(relaunches only when the daemon is down)", flush=True)
+    while True:
+        res = restart_serve()
+        if res.get("action") != "skip":
+            print(time.strftime("%Y-%m-%dT%H:%M:%S ") + json.dumps(res),
+                  flush=True)
+        time.sleep(interval)
 
 
 def check_daily_research():
@@ -291,6 +487,7 @@ def human_dur(seconds):
 
 def gather():
     procs = ps_snapshot()
+    capture_launch_spec(procs)          # remember how the daemon was launched
     checks = check_claude_services(procs)
     checks.append(check_daily_research())
     checks.append(check_daily_blog())
@@ -429,7 +626,7 @@ tick();setInterval(tick,12000);
 </script></body></html>"""
 
 
-def main():
+def run_web():
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     print(f"service-monitor listening on http://{BIND}:{PORT} "
           f"(host {HOSTNAME})", flush=True)
@@ -437,6 +634,33 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+
+
+USAGE = ("usage: monitor.py [serve | status | "
+         "restart-serve [--dry-run] | watch [--interval=N]]")
+
+
+def main():
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv else "serve"
+
+    if cmd in ("serve", "web"):
+        run_web()
+    elif cmd == "status":
+        print(json.dumps(gather(), indent=2))
+    elif cmd == "restart-serve":
+        res = restart_serve(dry_run="--dry-run" in argv)
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res.get("ok") else 1)
+    elif cmd == "watch":
+        interval = 30
+        for a in argv[1:]:
+            if a.startswith("--interval="):
+                interval = int(a.split("=", 1)[1])
+        watch_serve(interval)
+    else:
+        print(USAGE)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
