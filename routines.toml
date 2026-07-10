@@ -1,0 +1,46 @@
+# Scheduled routines shown on the dashboard's "Scheduled Routines" group.
+# Edit this file to add, remove, or retune a routine — no code changes needed.
+# (The Claude control-plane service checks are separate and live in code.)
+#
+# Each [[routine]] picks a `signal`, which selects a detector:
+#
+#   systemd-timer   — a systemd --user timer/service whose runner appends a
+#                     "=== run finished rc=N at <iso> ===" line to a log.
+#       service     (required) the .service unit
+#       unit        (optional) the .timer unit — checked active
+#       log_glob    (optional) glob of run logs; newest is read for the rc marker
+#       schedule    (optional) expected local "HH:MM" — drives "next run"
+#       stale_after (optional) warn if the last run is older than this (def 26h)
+#
+#   git-commit-age  — success shows up as a fresh commit in a repo (e.g. an
+#                     off-host agent that publishes by committing).
+#       repo        (required) path to the git repo (~ is expanded)
+#       grep        (optional) only count commits whose subject matches this
+#       warn_after / fail_after  (optional) age thresholds (def 26h / 50h)
+#       schedule    (optional) expected local "HH:MM"
+#
+#   process-match   — the routine is itself a long-running process.
+#       match       (required) a substring, or list of substrings all of which
+#                   must appear in the process command line
+#
+# Durations accept 26h, 90m, 2h30m, 45s, or a plain number of seconds.
+
+[[routine]]
+id = "daily-research"
+signal = "systemd-timer"
+service = "daily-research.service"
+unit = "daily-research.timer"
+log_glob = "~/routines/logs/daily-research-*.log"
+schedule = "22:02"
+stale_after = "26h"
+note = "systemd user timer on workbench · nightly 22:02"
+
+[[routine]]
+id = "daily-blog-post"
+signal = "git-commit-age"
+repo = "~/projects/iter8lab.net"
+grep = "^Add:"
+schedule = "23:02"
+warn_after = "26h"
+fail_after = "50h"
+note = "cloud agent (off-host) · publishes ~23:00 · health from commits"

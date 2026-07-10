@@ -88,12 +88,25 @@ connection locally if needed) before relying on it unattended.
 There is intentionally **no web trigger** for restart yet — a mutating endpoint
 on a network-exposed page is exactly the exposure risk tracked in the issues.
 
-## Adapting the checks
+## Scheduled routines (config)
 
-The checks are wired for one specific host. To add, remove, or retarget a check,
-edit the `check_*` functions and the `gather()` roll-up in `monitor.py` — each
-returns a plain dict, so a new check is just another function appended to the
-list.
+The routines under **Scheduled Routines** are defined in `routines.toml`, not in
+code — add, remove, or retune one by editing that file. Each `[[routine]]`
+selects a `signal`:
+
+| signal | for | key fields |
+|--------|-----|-----------|
+| `systemd-timer` | a `systemd --user` timer whose runner logs `=== run finished rc=N … ===` | `service`, `unit`, `log_glob`, `schedule`, `stale_after` |
+| `git-commit-age` | success shows up as a fresh commit (e.g. an off-host agent that publishes by committing) | `repo`, `grep`, `warn_after`, `fail_after`, `schedule` |
+| `process-match` | the routine is itself a long-running process | `match` (substring, or list of substrings) |
+
+Durations accept `26h`, `90m`, `2h30m`, `45s`, or plain seconds. A malformed or
+missing config — or a single bad routine — degrades to an error card and never
+takes down the page. Worked examples for both current routines ship in
+`routines.toml`.
+
+The Claude control-plane **service** checks are separate and stay in `monitor.py`
+(`check_claude_services`).
 
 ## Security note
 

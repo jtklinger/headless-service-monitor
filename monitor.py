@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -35,6 +36,10 @@ LAUNCH_SPEC = os.path.join(STATE_DIR, "serve-launch.json")
 RESTART_STATE = os.path.join(STATE_DIR, "serve-restart.json")
 RESTART_MAX = 3          # relaunch attempts allowed within the window
 RESTART_WINDOW = 1800    # seconds — the backoff window
+
+# Scheduled routines are defined here, not hardcoded (issue #3).
+ROUTINES_CONF = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "routines.toml")
 
 # A routine is "stale" once it is this far past its expected cadence.
 DAY = 86400
@@ -361,21 +366,123 @@ def watch_serve(interval):
         time.sleep(interval)
 
 
-def check_daily_research():
-    """systemd user timer/service on workbench + its log output."""
-    svc = sctl_user_show(
-        "daily-research.service",
-        ["ActiveState", "SubState", "Result", "ExecMainStatus"],
-    )
-    timer_active = run(["systemctl", "--user", "is-active",
-                        "daily-research.timer"])[1]
+# --------------------------------------------------------------------------- #
+# scheduled routines  (issue #3)
+#
+# Routines are defined in routines.toml, not hardcoded here. Each [[routine]]
+# picks a `signal` mapped to one of the detectors below, so adding, editing, or
+# removing a monitored routine is a config change, not a code change.
+# --------------------------------------------------------------------------- #
+def parse_duration(val, default=None):
+    """Parse '26h', '90m', '2h30m', '45s', or a plain number of seconds."""
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip()
+    if s.isdigit():
+        return int(s)
+    units = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    total, num = 0, ""
+    for ch in s:
+        if ch.isdigit():
+            num += ch
+        elif ch in units and num:
+            total += int(num) * units[ch]
+            num = ""
+        else:
+            raise ValueError(f"bad duration: {val!r}")
+    if num:                              # trailing bare number == seconds
+        total += int(num)
+    return total
 
+
+def _sched_next(schedule):
+    """Epoch of the next local HH:MM occurrence, or None."""
+    if not schedule:
+        return None
+    try:
+        hh, mm = str(schedule).split(":")
+        return next_daily(int(hh), int(mm))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _routine_card(cfg, status, summary, detail, last_run, next_run):
+    return {
+        "id": cfg["id"], "group": "Scheduled Routines",
+        "name": cfg.get("name", cfg["id"]),
+        "status": status, "summary": summary, "detail": detail,
+        "last_run": last_run, "next_run": next_run, "note": cfg.get("note"),
+    }
+
+
+def load_routines():
+    """Read routines.toml -> (list_of_routine_dicts, error_or_None)."""
+    try:
+        with open(ROUTINES_CONF, "rb") as fh:
+            data = tomllib.load(fh)
+    except FileNotFoundError:
+        return [], f"routines.toml not found ({ROUTINES_CONF})"
+    except tomllib.TOMLDecodeError as exc:
+        return [], f"invalid TOML: {exc}"
+    except OSError as exc:
+        return [], str(exc)
+    routines = data.get("routine", [])
+    if not isinstance(routines, list):
+        return [], "expected an array of [[routine]] tables"
+    return routines, None
+
+
+def build_routine_checks(procs):
+    """Build the Scheduled Routines cards from config. A broken config, or one
+    bad routine, degrades to an error card instead of taking down the page."""
+    routines, err = load_routines()
+    if err:
+        return [{"id": "routines-config", "group": "Scheduled Routines",
+                 "name": "routine config", "status": "fail",
+                 "summary": "config error",
+                 "detail": [{"label": "routines.toml", "value": err}]}]
+    out = []
+    for cfg in routines:
+        rid = cfg.get("id", "?")
+        try:
+            out.append(check_routine(cfg, procs))
+        except Exception as exc:  # noqa: BLE001 — isolate a bad routine
+            out.append({"id": rid, "group": "Scheduled Routines",
+                        "name": rid, "status": "warn",
+                        "summary": "check error",
+                        "detail": [{"label": "Error", "value": str(exc)}]})
+    return out
+
+
+def check_routine(cfg, procs):
+    sig = cfg.get("signal")
+    if sig == "systemd-timer":
+        return _signal_systemd_timer(cfg)
+    if sig == "git-commit-age":
+        return _signal_git_commit_age(cfg)
+    if sig == "process-match":
+        return _signal_process_match(cfg, procs)
+    return _routine_card(cfg, "fail", f"unknown signal: {sig!r}",
+                         [{"label": "signal", "value": str(sig)}], None,
+                         _sched_next(cfg.get("schedule")))
+
+
+def _signal_systemd_timer(cfg):
+    """A routine driven by a systemd timer/service with an rc-marked log."""
+    svc = sctl_user_show(
+        cfg["service"],
+        ["ActiveState", "SubState", "Result", "ExecMainStatus"])
+    unit = cfg.get("unit")
+    timer_active = (run(["systemctl", "--user", "is-active", unit])[1]
+                    if unit else "n/a")
     running = (svc.get("ActiveState") == "activating"
                or svc.get("SubState") in ("start", "running"))
 
-    # Newest log + its rc marker.
-    logs = sorted(glob.glob(f"{HOME}/routines/logs/daily-research-*.log"))
-    last_epoch, last_rc, log_name, log_size = None, None, None, None
+    last_epoch = last_rc = log_name = log_size = None
+    logs = (sorted(glob.glob(os.path.expanduser(cfg["log_glob"])))
+            if cfg.get("log_glob") else [])
     if logs:
         newest = logs[-1]
         log_name = os.path.basename(newest)
@@ -387,8 +494,7 @@ def check_daily_research():
         try:
             with open(newest, "r", errors="replace") as fh:
                 tail = fh.read()[-4000:]
-            m = list(re.finditer(
-                r"run finished rc=(\d+) at (\S+)", tail))
+            m = list(re.finditer(r"run finished rc=(\d+) at (\S+)", tail))
             if m:
                 last_rc = int(m[-1].group(1))
                 try:
@@ -400,10 +506,11 @@ def check_daily_research():
             pass
 
     age = (time.time() - last_epoch) if last_epoch else None
+    stale = parse_duration(cfg.get("stale_after"), RESEARCH_STALE_S)
 
     if running:
         status, summary = "running", "run in progress"
-    elif timer_active != "active":
+    elif unit and timer_active != "active":
         status, summary = "fail", f"timer {timer_active or 'inactive'}"
     elif last_rc not in (0, None):
         status, summary = "fail", f"last run exited rc={last_rc}"
@@ -411,7 +518,7 @@ def check_daily_research():
         status, summary = "fail", f"service result: {svc.get('Result')}"
     elif last_epoch is None:
         status, summary = "warn", "no run recorded yet"
-    elif age > RESEARCH_STALE_S:
+    elif age > stale:
         status, summary = "warn", f"stale — last run {human_dur(age)} ago"
     else:
         status, summary = "ok", f"last run {human_dur(age)} ago"
@@ -426,22 +533,21 @@ def check_daily_research():
         {"label": "Log", "value":
             f"{log_name} ({log_size}B)" if log_name else "none"},
     ]
-    return {
-        "id": "daily-research", "group": "Scheduled Routines",
-        "name": "daily-research", "status": status, "summary": summary,
-        "detail": detail,
-        "last_run": last_epoch, "next_run": next_daily(22, 2),
-        "note": "systemd user timer on workbench · nightly 22:02",
-    }
+    return _routine_card(cfg, status, summary, detail, last_epoch,
+                         _sched_next(cfg.get("schedule")))
 
 
-def check_daily_blog():
-    """Cloud agent — no local runner. Health inferred from blog git commits."""
-    repo = f"{HOME}/projects/iter8lab.net"
-    rc, out, _ = run(["git", "-C", repo, "log", "-1",
-                      "--grep=^Add:", "--format=%ct%x09%s"])
-    if rc != 0 or not out:
-        rc, out, _ = run(["git", "-C", repo, "log", "-1", "--format=%ct%x09%s"])
+def _signal_git_commit_age(cfg):
+    """A routine whose success shows up as a fresh commit in a git repo."""
+    repo = os.path.expanduser(cfg["repo"])
+    grep = cfg.get("grep")
+    base = ["git", "-C", repo, "log", "-1", "--format=%ct%x09%s"]
+    if grep:
+        rc, out, _ = run(base[:5] + [f"--grep={grep}"] + base[5:])
+        if rc != 0 or not out:           # fall back to newest commit of any kind
+            rc, out, _ = run(base)
+    else:
+        rc, out, _ = run(base)
     last_epoch, subject = None, None
     if rc == 0 and out and "\t" in out:
         ep, subject = out.split("\t", 1)
@@ -451,27 +557,49 @@ def check_daily_blog():
             pass
 
     age = (time.time() - last_epoch) if last_epoch else None
+    warn = parse_duration(cfg.get("warn_after"), BLOG_WARN_S)
+    fail = parse_duration(cfg.get("fail_after"), BLOG_FAIL_S)
     if last_epoch is None:
-        status, summary = "unknown", "no commits found in blog repo"
-    elif age > BLOG_FAIL_S:
-        status, summary = "fail", f"no post in {human_dur(age)}"
-    elif age > BLOG_WARN_S:
-        status, summary = "warn", f"last post {human_dur(age)} ago"
+        status, summary = "unknown", "no commits found in repo"
+    elif age > fail:
+        status, summary = "fail", f"no commit in {human_dur(age)}"
+    elif age > warn:
+        status, summary = "warn", f"last commit {human_dur(age)} ago"
     else:
-        status, summary = "ok", f"last post {human_dur(age)} ago"
+        status, summary = "ok", f"last commit {human_dur(age)} ago"
 
     detail = [
-        {"label": "Last post", "value":
-            (subject[:60] if subject else "n/a")},
-        {"label": "Signal", "value": "iter8lab.net git HEAD (local clone)"},
+        {"label": "Last commit", "value": (subject[:60] if subject else "n/a")},
+        {"label": "Signal", "value":
+            f"{os.path.basename(repo)} git HEAD (local clone)"},
     ]
-    return {
-        "id": "daily-blog-post", "group": "Scheduled Routines",
-        "name": "daily-blog-post", "status": status, "summary": summary,
-        "detail": detail,
-        "last_run": last_epoch, "next_run": next_daily(23, 2),
-        "note": "cloud agent (off-host) · publishes ~23:00 · health from commits",
-    }
+    return _routine_card(cfg, status, summary, detail, last_epoch,
+                         _sched_next(cfg.get("schedule")))
+
+
+def _signal_process_match(cfg, procs):
+    """A routine that is itself a long-running process; up/down by ps match."""
+    subs = cfg.get("match") if isinstance(cfg.get("match"), list) \
+        else [cfg.get("match")]
+    hit = next((p for p in procs if all(s in p[4] for s in subs if s)), None)
+    if hit:
+        pid, etimes, pcpu, pmem, _ = hit
+        try:
+            uptime = int(etimes)
+        except ValueError:
+            uptime = None
+        status, summary = "ok", f"running · pid {pid}"
+        detail = [
+            {"label": "PID", "value": pid},
+            {"label": "Uptime", "value": human_dur(uptime)},
+            {"label": "CPU", "value": f"{pcpu}%"},
+            {"label": "MEM", "value": f"{pmem}%"},
+        ]
+    else:
+        status, summary = "fail", "not running"
+        detail = [{"label": "Process", "value": "no match in ps"}]
+    return _routine_card(cfg, status, summary, detail, None,
+                         _sched_next(cfg.get("schedule")))
 
 
 def human_dur(seconds):
@@ -491,8 +619,7 @@ def gather():
     procs = ps_snapshot()
     capture_launch_spec(procs)          # remember how the daemon was launched
     checks = check_claude_services(procs)
-    checks.append(check_daily_research())
-    checks.append(check_daily_blog())
+    checks.extend(build_routine_checks(procs))
     overall = "ok"
     for c in checks:
         if SEVERITY.get(c["status"], 2) > SEVERITY.get(overall, 0):
