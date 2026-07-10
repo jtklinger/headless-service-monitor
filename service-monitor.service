@@ -4,7 +4,11 @@ After=default.target
 
 [Service]
 Type=simple
-Environment=MONITOR_BIND=0.0.0.0
+# Bind address. 127.0.0.1 = localhost-only (view via SSH tunnel). Set to a
+# specific interface IP (ideally a VPN/mesh address) to expose it there. Avoid
+# 0.0.0.0 unless a firewall scopes the port. IP_FREEBIND handles interfaces that
+# appear after boot.
+Environment=MONITOR_BIND=127.0.0.1
 Environment=MONITOR_PORT=8787
 ExecStart=/usr/bin/python3 %h/routines/monitor/monitor.py
 Restart=on-failure

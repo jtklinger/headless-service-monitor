@@ -23,7 +23,9 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = os.path.expanduser("~")
-BIND = os.environ.get("MONITOR_BIND", "0.0.0.0")
+# Default to localhost — a safe default. Set MONITOR_BIND to a specific
+# interface IP (e.g. a VPN/mesh address) to expose the page only there.
+BIND = os.environ.get("MONITOR_BIND", "127.0.0.1")
 PORT = int(os.environ.get("MONITOR_PORT", "8787"))
 HOSTNAME = socket.gethostname()
 
@@ -626,8 +628,24 @@ tick();setInterval(tick,12000);
 </script></body></html>"""
 
 
+class MonitorServer(ThreadingHTTPServer):
+    """HTTP server that can bind an interface address before it exists.
+
+    IP_FREEBIND lets us bind e.g. a VPN/mesh IP even if that interface comes up
+    after this service at boot, instead of crash-looping until it appears."""
+    allow_reuse_address = True
+
+    def server_bind(self):
+        freebind = getattr(socket, "IP_FREEBIND", 15)  # Linux value
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IP, freebind, 1)
+        except OSError:
+            pass
+        super().server_bind()
+
+
 def run_web():
-    srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    srv = MonitorServer((BIND, PORT), Handler)
     print(f"service-monitor listening on http://{BIND}:{PORT} "
           f"(host {HOSTNAME})", flush=True)
     try:

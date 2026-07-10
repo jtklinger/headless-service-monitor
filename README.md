@@ -34,7 +34,7 @@ Environment overrides:
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `MONITOR_BIND` | `0.0.0.0` | interface to bind |
+| `MONITOR_BIND` | `127.0.0.1` | interface IP to bind (localhost by default) |
 | `MONITOR_PORT` | `8787` | port |
 
 ## Endpoints
@@ -97,10 +97,14 @@ list.
 
 ## Security note
 
-By default the server binds `0.0.0.0`, which exposes the page to anything that
-can route to the host. The data is low-sensitivity (process names and run
-status), but you should still restrict access — bind to a private interface or
-localhost, or add a firewall rule scoping the port. See the repo issues.
+The server binds `127.0.0.1` by default, so out of the box it is reachable only
+from the host itself — view it through an SSH tunnel
+(`ssh -L 8787:localhost:8787 <host>`). To expose it, set `MONITOR_BIND` to a
+specific interface IP, ideally a private VPN/mesh address rather than a LAN or
+public one. Binding `0.0.0.0` exposes the page to anything that can route to the
+host; only do that behind a firewall that scopes the port. `IP_FREEBIND` is set
+on the socket, so binding an interface that only appears after boot (e.g. a VPN)
+works without crash-looping.
 
 ## License
 
