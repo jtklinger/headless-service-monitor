@@ -90,39 +90,76 @@ def sctl_user_show(unit, props):
 # --------------------------------------------------------------------------- #
 # checks
 # --------------------------------------------------------------------------- #
+def rpc_socket_present(args):
+    """True/False if the daemon's --socket path exists; None if unparseable."""
+    m = re.search(r"--socket\s+(\S+)", args)
+    if not m:
+        return None
+    try:
+        return os.path.exists(m.group(1))
+    except OSError:
+        return None
+
+
 def check_claude_services(procs):
-    """The ccd remote daemons that make workbench reachable from claude.ai."""
-    specs = [
-        ("claude-remote-serve", "Claude remote server",
-         lambda a: "remote/srv/" in a and " --serve" in a),
-        ("claude-remote-bridge", "Claude remote bridge",
-         lambda a: "remote/srv/" in a and " --bridge" in a),
-    ]
+    """The ccd remote control-plane daemons on this host.
+
+    Only the `--serve` daemon is a persistent service (reparented to init), so it
+    is the real control-plane health signal. The `--bridge` processes are spawned
+    per remote SSH connection, so their absence just means "no one is connected"
+    — that is reported as an active-connection count, never as a failure.
+    """
     items = []
-    for cid, name, match in specs:
-        hit = next((p for p in procs if match(p[4])), None)
-        if hit:
-            pid, etimes, pcpu, pmem, _ = hit
-            try:
-                uptime = int(etimes)
-            except ValueError:
-                uptime = None
-            items.append({
-                "id": cid, "group": "Claude Services", "name": name,
-                "status": "ok", "summary": f"running · pid {pid}",
-                "detail": [
-                    {"label": "PID", "value": pid},
-                    {"label": "Uptime", "value": human_dur(uptime)},
-                    {"label": "CPU", "value": f"{pcpu}%"},
-                    {"label": "MEM", "value": f"{pmem}%"},
-                ],
-            })
-        else:
-            items.append({
-                "id": cid, "group": "Claude Services", "name": name,
-                "status": "fail", "summary": "not running",
-                "detail": [{"label": "Process", "value": "no match in ps"}],
-            })
+
+    # Persistent serve daemon — the actual control-plane health.
+    serve = next((p for p in procs
+                  if "remote/srv/" in p[4] and " --serve" in p[4]), None)
+    if serve:
+        pid, etimes, pcpu, pmem, args = serve
+        try:
+            uptime = int(etimes)
+        except ValueError:
+            uptime = None
+        sock_ok = rpc_socket_present(args)
+        status = "ok"
+        summary = f"running · pid {pid}"
+        if sock_ok is False:
+            status, summary = "warn", f"running · pid {pid} · rpc socket missing"
+        items.append({
+            "id": "claude-remote-serve", "group": "Claude Services",
+            "name": "Claude remote server", "status": status, "summary": summary,
+            "detail": [
+                {"label": "PID", "value": pid},
+                {"label": "Uptime", "value": human_dur(uptime)},
+                {"label": "CPU", "value": f"{pcpu}%"},
+                {"label": "MEM", "value": f"{pmem}%"},
+                {"label": "RPC socket", "value":
+                    {True: "present", False: "missing"}.get(sock_ok, "unknown")},
+            ],
+        })
+    else:
+        items.append({
+            "id": "claude-remote-serve", "group": "Claude Services",
+            "name": "Claude remote server", "status": "fail",
+            "summary": "not running",
+            "detail": [{"label": "Process", "value": "no --serve daemon in ps"}],
+        })
+
+    # Bridges — one per active remote SSH connection; absent == idle, not down.
+    bridges = [p for p in procs
+               if "remote/srv/" in p[4] and " --bridge" in p[4]]
+    n = len(bridges)
+    detail = [{"label": "Active", "value": str(n)}]
+    uptimes = [int(b[1]) for b in bridges if b[1].isdigit()]
+    if uptimes:
+        detail.append({"label": "Longest", "value": human_dur(max(uptimes))})
+    items.append({
+        "id": "claude-remote-connections", "group": "Claude Services",
+        "name": "Remote connections", "status": "ok",
+        "summary": (f"{n} active" if n else "idle · 0 connected"),
+        "detail": detail,
+        "note": "bridge processes are spawned per remote SSH connection",
+    })
     return items
 
 
