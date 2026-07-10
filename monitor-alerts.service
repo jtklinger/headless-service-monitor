@@ -1,0 +1,10 @@
+[Unit]
+Description=Service monitor alert evaluator (notify on status transitions)
+After=default.target
+
+[Service]
+Type=oneshot
+# Optional delivery config (webhook URL, SMTP creds, heartbeat URL). The leading
+# '-' makes it optional; keep real secrets in state/alert.env (gitignored).
+EnvironmentFile=-%h/routines/monitor/state/alert.env
+ExecStart=/usr/bin/python3 %h/routines/monitor/monitor.py alert

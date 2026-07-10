@@ -41,6 +41,11 @@ RESTART_WINDOW = 1800    # seconds — the backoff window
 ROUTINES_CONF = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "routines.toml")
 
+# Alerting (issue #2). State + local alert log live under the gitignored state/.
+ALERT_STATE = os.path.join(STATE_DIR, "alert-state.json")
+ALERT_LOG = os.path.join(STATE_DIR, "alerts.log")
+BAD = {"warn", "fail"}   # statuses that count as "a problem" for alerting
+
 # A routine is "stale" once it is this far past its expected cadence.
 DAY = 86400
 RESEARCH_STALE_S = 26 * 3600   # daily → warn if last run older than 26h
@@ -633,6 +638,145 @@ def gather():
 
 
 # --------------------------------------------------------------------------- #
+# alerting  (issue #2)
+#
+# A separate evaluator (run by a systemd timer) diffs each check's status against
+# saved state and notifies ONLY on transitions across the warn/fail boundary —
+# never on every poll. It runs gather() in-process, so it keeps working even if
+# the web server is down. Delivery is pluggable and configured via env (secrets
+# in a gitignored EnvironmentFile); with nothing configured it logs to a file.
+# --------------------------------------------------------------------------- #
+def _load_alert_state():
+    try:
+        with open(ALERT_STATE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None   # no baseline yet
+
+
+def _save_alert_state(statuses):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(ALERT_STATE, "w") as fh:
+            json.dump({"statuses": statuses, "updated": time.time()}, fh,
+                      indent=2)
+    except OSError:
+        pass
+
+
+def evaluate_alerts(checks, prev):
+    """Pure diff: given current checks and prev {id: status}, return
+    (transitions, new_statuses). Fires when a check crosses the warn/fail
+    boundary in either direction; silent on the first run (prev is None)."""
+    new = {c["id"]: c["status"] for c in checks}
+    if prev is None:
+        return [], new                       # establish baseline silently
+    by_id = {c["id"]: c for c in checks}
+    transitions = []
+    for cid, cur in new.items():
+        was = prev.get(cid, "ok")            # a newly-seen check compares to ok
+        if cur != was and (cur in BAD or was in BAD):
+            kind = ("recovered" if cur not in BAD
+                    else "escalated" if was in BAD else "problem")
+            transitions.append({
+                "id": cid, "from": was, "to": cur, "kind": kind,
+                "summary": by_id[cid].get("summary", ""),
+                "group": by_id[cid].get("group", ""),
+            })
+    return transitions, new
+
+
+def _fmt_alert(transitions, host):
+    n_bad = sum(1 for t in transitions if t["to"] in BAD)
+    n_ok = len(transitions) - n_bad
+    parts = ([f"{n_bad} problem{'s' if n_bad != 1 else ''}"] if n_bad else []) \
+        + ([f"{n_ok} recovered"] if n_ok else [])
+    subject = f"[{host}] monitor: " + ", ".join(parts)
+    lines = [f"  [{t['to']}] {t['id']}: {t['summary']}  ({t['from']} -> "
+             f"{t['to']})" for t in transitions]
+    return subject, subject + "\n" + "\n".join(lines)
+
+
+def _notify_log(subject, body):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(ALERT_LOG, "a") as fh:
+            fh.write(time.strftime("%Y-%m-%dT%H:%M:%S ") + body + "\n\n")
+    except OSError:
+        pass
+
+
+def _notify_webhook(subject, body, transitions):
+    url = os.environ.get("MONITOR_ALERT_WEBHOOK")
+    if not url:
+        return
+    import urllib.request
+    data = json.dumps({"text": body, "subject": subject,
+                       "transitions": transitions}).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10).close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"alert: webhook failed: {exc}", file=sys.stderr)
+
+
+def _notify_email(subject, body):
+    host = os.environ.get("MONITOR_ALERT_SMTP_HOST")
+    to = os.environ.get("MONITOR_ALERT_EMAIL_TO")
+    if not host or not to:
+        return
+    import smtplib
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = os.environ.get("MONITOR_ALERT_EMAIL_FROM", f"monitor@{HOSTNAME}")
+    msg["To"] = to
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP(host, int(os.environ.get("MONITOR_ALERT_SMTP_PORT",
+                                                    "25")), timeout=15) as s:
+            if os.environ.get("MONITOR_ALERT_SMTP_STARTTLS"):
+                s.starttls()
+            user = os.environ.get("MONITOR_ALERT_SMTP_USER")
+            if user:
+                s.login(user, os.environ.get("MONITOR_ALERT_SMTP_PASS", ""))
+            s.send_message(msg)
+    except Exception as exc:  # noqa: BLE001
+        print(f"alert: email failed: {exc}", file=sys.stderr)
+
+
+def _heartbeat():
+    """Dead-man's switch: ping an external URL each run so an outside service
+    notices if this evaluator stops (answers 'who watches the watcher')."""
+    url = os.environ.get("MONITOR_ALERT_HEARTBEAT_URL")
+    if not url:
+        return
+    import urllib.request
+    try:
+        urllib.request.urlopen(url, timeout=10).close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"alert: heartbeat failed: {exc}", file=sys.stderr)
+
+
+def run_alert_cycle(dry_run=False):
+    state = _load_alert_state()
+    prev = state.get("statuses") if state else None
+    data = gather()
+    transitions, new = evaluate_alerts(data["checks"], prev)
+    if transitions and not dry_run:
+        subject, body = _fmt_alert(transitions, data["host"])
+        _notify_log(subject, body)
+        _notify_webhook(subject, body, transitions)
+        _notify_email(subject, body)
+    if not dry_run:
+        _save_alert_state(new)
+        _heartbeat()
+    return {"baseline": prev is None, "overall": data["overall"],
+            "transitions": transitions}
+
+
+# --------------------------------------------------------------------------- #
 # http
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
@@ -781,7 +925,7 @@ def run_web():
         pass
 
 
-USAGE = ("usage: monitor.py [serve | status | "
+USAGE = ("usage: monitor.py [serve | status | alert [--dry-run] | "
          "restart-serve [--dry-run] | watch [--interval=N]]")
 
 
@@ -793,6 +937,9 @@ def main():
         run_web()
     elif cmd == "status":
         print(json.dumps(gather(), indent=2))
+    elif cmd == "alert":
+        print(json.dumps(run_alert_cycle(dry_run="--dry-run" in argv),
+                         indent=2))
     elif cmd == "restart-serve":
         res = restart_serve(dry_run="--dry-run" in argv)
         print(json.dumps(res, indent=2))

@@ -108,6 +108,31 @@ takes down the page. Worked examples for both current routines ship in
 The Claude control-plane **service** checks are separate and stay in `monitor.py`
 (`check_claude_services`).
 
+## Alerts
+
+A separate evaluator (systemd timer, every 5 min) diffs each check against saved
+state and notifies **only on transitions** across the warn/fail boundary — a
+check going ok→warn/fail fires once, a recovery fires once, and nothing repeats
+while a check stays put. It runs the checks in-process, so alerting keeps working
+even if the web server is down.
+
+```bash
+python3 monitor.py alert            # one evaluation cycle
+python3 monitor.py alert --dry-run  # show transitions without sending or saving
+```
+
+Install `monitor-alerts.service` + `monitor-alerts.timer` into
+`~/.config/systemd/user/` and `enable --now` the timer.
+
+**Delivery** is configured via environment (keep secrets in a gitignored
+`state/alert.env`; see `alert.env.example`). With nothing set, alerts are still
+appended to `state/alerts.log`. All channels are additive:
+
+- `MONITOR_ALERT_WEBHOOK` — POST JSON (the `text` field is Slack/Mattermost-friendly)
+- `MONITOR_ALERT_SMTP_*` / `MONITOR_ALERT_EMAIL_*` — email via stdlib SMTP
+- `MONITOR_ALERT_HEARTBEAT_URL` — dead-man's switch pinged each run, so an
+  external service notices if the evaluator itself stops
+
 ## Security note
 
 The server binds `127.0.0.1` by default, so out of the box it is reachable only
