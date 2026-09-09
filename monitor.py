@@ -415,7 +415,7 @@ def _sched_next(schedule):
 
 def _routine_card(cfg, status, summary, detail, last_run, next_run):
     return {
-        "id": cfg["id"], "group": "Scheduled Routines",
+        "id": cfg["id"], "group": cfg.get("group", "Scheduled Routines"),
         "name": cfg.get("name", cfg["id"]),
         "status": status, "summary": summary, "detail": detail,
         "last_run": last_run, "next_run": next_run, "note": cfg.get("note"),
@@ -469,6 +469,8 @@ def check_routine(cfg, procs):
         return _signal_git_commit_age(cfg)
     if sig == "process-match":
         return _signal_process_match(cfg, procs)
+    if sig == "systemd-service":
+        return _signal_systemd_service(cfg)
     return _routine_card(cfg, "fail", f"unknown signal: {sig!r}",
                          [{"label": "signal", "value": str(sig)}], None,
                          _sched_next(cfg.get("schedule")))
@@ -605,6 +607,59 @@ def _signal_process_match(cfg, procs):
         detail = [{"label": "Process", "value": "no match in ps"}]
     return _routine_card(cfg, status, summary, detail, None,
                          _sched_next(cfg.get("schedule")))
+
+
+def _signal_systemd_service(cfg):
+    """A long-running systemd --user service (no timer): up/down from unit
+    state, with restart-loop detection via NRestarts."""
+    unit = cfg["service"]
+    u = sctl_user_show(unit, [
+        "ActiveState", "SubState", "Result", "NRestarts", "MainPID",
+        "ActiveEnterTimestamp", "MemoryCurrent", "UnitFileState"])
+    active, sub = u.get("ActiveState", "?"), u.get("SubState", "?")
+    try:
+        restarts = int(u.get("NRestarts") or 0)
+    except ValueError:
+        restarts = 0
+    max_restarts = int(cfg.get("warn_restarts", 3))
+
+    since = None
+    ts = u.get("ActiveEnterTimestamp") or ""
+    if ts:
+        rc, out, _ = run(["date", "-d", ts, "+%s"])
+        if rc == 0 and out.isdigit():
+            since = int(out)
+    uptime = (time.time() - since) if since else None
+
+    if active == "active" and sub == "running":
+        if restarts >= max_restarts:
+            status = "warn"
+            summary = f"running · {restarts} restarts since boot"
+        else:
+            status, summary = "ok", f"running · pid {u.get('MainPID', '?')}"
+    elif active == "activating":
+        status, summary = "fail", f"restart-looping ({restarts} restarts)"
+    elif active == "failed":
+        status, summary = "fail", f"failed ({u.get('Result', '?')})"
+    elif active == "inactive":
+        status, summary = "fail", "stopped"
+    else:
+        status, summary = "warn", f"{active}/{sub}"
+
+    mem = u.get("MemoryCurrent")
+    try:
+        mem_s = f"{int(mem) / 1048576:.0f} MiB" if mem and mem.isdigit() \
+            else "n/a"
+    except ValueError:
+        mem_s = "n/a"
+    detail = [
+        {"label": "Unit", "value": f"{unit} ({u.get('UnitFileState', '?')})"},
+        {"label": "State", "value": f"{active}/{sub}"},
+        {"label": "Uptime", "value": human_dur(uptime)},
+        {"label": "Restarts", "value": str(restarts)},
+        {"label": "MEM", "value": mem_s},
+    ]
+    return _routine_card(cfg, status, summary, detail, since, None)
 
 
 def human_dur(seconds):
