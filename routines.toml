@@ -53,6 +53,16 @@ warn_after = "26h"
 fail_after = "50h"
 note = "cloud agent (off-host) · publishes ~23:00 · health from commits"
 
+[[routine]]
+id = "claude-config-check"
+signal = "systemd-timer"
+service = "claude-config-check.service"
+unit = "claude-config-check.timer"
+log_glob = "~/routines/logs/claude-config-check-*.log"
+schedule = "09:05"
+stale_after = "26h"
+note = "systemd user timer on workbench \u00b7 daily 09:05 \u00b7 shared ~/.claude config drift vs projects-root claude/"
+
 # --- Claude Remote Control servers (claude-rc.service + claude-rc@<repo>) ---
 # One persistent `claude remote-control` per repo so the workbench sessions
 # are always listed in claude.ai/code, the desktop app, and the mobile app.
