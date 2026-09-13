@@ -403,14 +403,21 @@ def parse_duration(val, default=None):
 
 
 def _sched_next(schedule):
-    """Epoch of the next local HH:MM occurrence, or None."""
+    """Epoch of the next local HH:MM occurrence, or None.
+
+    Accepts a comma-separated list ("07:15,19:15") for routines that run more than
+    once a day, and returns the soonest of them.
+    """
     if not schedule:
         return None
-    try:
-        hh, mm = str(schedule).split(":")
-        return next_daily(int(hh), int(mm))
-    except (ValueError, AttributeError):
-        return None
+    nexts = []
+    for part in str(schedule).split(","):
+        try:
+            hh, mm = part.strip().split(":")
+            nexts.append(next_daily(int(hh), int(mm)))
+        except (ValueError, AttributeError):
+            continue
+    return min(nexts) if nexts else None
 
 
 def _routine_card(cfg, status, summary, detail, last_run, next_run):
