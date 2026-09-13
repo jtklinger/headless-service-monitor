@@ -63,6 +63,16 @@ schedule = "09:05"
 stale_after = "26h"
 note = "systemd user timer on workbench \u00b7 daily 09:05 \u00b7 shared ~/.claude config drift vs projects-root claude/"
 
+[[routine]]
+id = "claude-backup"
+signal = "systemd-timer"
+service = "claude-backup.service"
+unit = "claude-backup.timer"
+log_glob = "~/routines/logs/claude-backup-*.log"
+schedule = "07:15,19:15"
+stale_after = "14h"
+note = "systemd user timer on workbench \u00b7 07:15 and 19:15 \u00b7 snapshots ~/.claude to claude-code-backup-workbench"
+
 # --- Claude Remote Control servers (claude-rc.service + claude-rc@<repo>) ---
 # One persistent `claude remote-control` per repo so the workbench sessions
 # are always listed in claude.ai/code, the desktop app, and the mobile app.
